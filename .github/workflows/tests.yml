@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 capsplus-linux contributors
+# CI：只跑标准库能跑的东西。
+#
+# 三条刻意的设计（改这个文件前先读）：
+#   1. **不装 python3-gi**。ubuntu-latest 默认就没有 PyGObject，测试套件必须在
+#      "没有 gi" 的机器上也能收集 + 跑完（界面用例自己 skip）。这条由
+#      `tests/test_no_gi_smoke.py` 守着 —— 谁在测试模块顶层裸写 `import gi`，CI 就红。
+#   2. **不碰 /etc、不用 sudo**。`capsplus apply` 要写 /etc/keyd，CI 只跑单测；
+#      真机端到端验收（`tools/e2e/check_mappings.py`）需要 root + /dev/uinput，不进 CI。
+#   3. **界面测试默认关**。它们会真弹窗（会抢正在用人手里的键盘焦点），
+#      要跑就 `CAPSPLUS_GUI=1` 且在虚拟显示下：
+#        xvfb-run -a env -u WAYLAND_DISPLAY CAPSPLUS_GUI=1 python3 -m unittest discover -s tests
+
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]     # 下限 3.11：用了标准库 tomllib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # 语法层面全仓过一遍（含 bin/ 之外的所有 .py；bin/ 下的入口没有 .py 后缀，
+      # 由单测里"子进程跑真入口"那条判据覆盖，见 tests/test_settings_window.py）
+      - name: compileall
+        run: python3 -m compileall -q .
+
+      - name: 全量单测（无 python3-gi / 无显示服务器 / 无 sudo）
+        run: python3 -m unittest discover -s tests -v
+
+  # ── 界面测试专用 job ────────────────────────────────────────────────
+  # 为什么单开一个：上面那个 job 刻意不装 python3-gi（守"没有 gi 也要能收集"的契约），
+  # 代价是 35 条真起窗的界面用例在 CI 里全 skip —— 那等于界面行为从来没被 CI 验过。
+  # 这里装上 gi + GTK3 的 gir，在 Xvfb 虚拟显示里把它们**真跑一遍**（拿覆盖率，不是假绿）。
+  #
+  # 两个必须是"外部设置"的细节（进程内补救都太晚，实测过）：
+  #   - `env -u WAYLAND_DISPLAY`：不摘掉它，libwayland 会连真实 Wayland 桌面。
+  #   - `GDK_BACKEND=x11` 必须在启动解释器**之前**设进环境：GDK 读它比 Python 早。
+  gui-tests:
+    name: 界面测试（Xvfb + PyGObject）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ⚠ **不要用 setup-python**：`python3-gi` 装在系统 `/usr/lib/python3/dist-packages`，
+      # setup-python 那个 pyenv 解释器看不见它 → `import gi` 失败 → 35 条界面用例全 skip，
+      # 而 job 照样显示 success（2026-10-16 首跑就是这么假绿的）。ubuntu-latest 系统 python
+      # 是 3.12，满足本仓 ≥3.11 的下限，直接用系统解释器。
+      - name: 诊断解释器与 gi 是否可用（假绿过一次，这里必须把根因打出来）
+        run: |
+          python3 -V
+          python3 -c "import sys; print('sys.path 里有 dist-packages:', any('dist-packages' in p for p in sys.path))"
+          python3 -c "import gi; print('gi OK ->', gi.__file__)"
+
+      - name: 装 PyGObject 与 GTK3 的 gir（界面测试要用）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3-gi gir1.2-gtk-3.0 gir1.2-pango-1.0
+
+      - name: 虚拟显示里真跑界面测试
+        run: |
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            env -u WAYLAND_DISPLAY GDK_BACKEND=x11 CAPSPLUS_GUI=1 \
+            python3 -m unittest discover -s tests -v
